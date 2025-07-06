@@ -8,26 +8,39 @@ import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
 
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+from sklearn.preprocessing import LabelEncoder, OneHotEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
-    roc_auc_score, confusion_matrix, roc_curve
+    roc_auc_score, confusion_matrix, roc_curve, classification_report
 )
+from sklearn.feature_selection import SelectFromModel
+
+import warnings
+warnings.filterwarnings('ignore')
 
 # ============ 3. Load Dataset ============
-# Gantilah dengan nama file yang diupload
 df = pd.read_csv(list(uploaded.keys())[0])
 
-# ============ 4. Binarisasi Target ============
-df['productivity_class'] = df['actual_productivity_score'].apply(lambda x: 1 if x >= 6 else 0)
-df.drop(columns=['actual_productivity_score', 'perceived_productivity_score'], inplace=True)
+# ============ 4. Target Binarization (Adaptif) ============
+if df['actual_productivity_score'].notnull().sum() > len(df) * 0.7:
+    threshold = df['actual_productivity_score'].median()
+    df['productivity_class'] = (df['actual_productivity_score'] >= threshold).astype(int)
+    print(f"Threshold produktif (actual): {threshold}")
+else:
+    threshold = df['perceived_productivity_score'].median()
+    df['productivity_class'] = (df['perceived_productivity_score'] >= threshold).astype(int)
+    print(f"Threshold produktif (perceived): {threshold}")
 
-# ============ 5. Tangani Missing Value ============
-num_cols = df.select_dtypes(include=['float64', 'int64']).columns
-cat_cols = df.select_dtypes(include=['object', 'bool']).columns
+# ============ 5. Drop Kolom Target dan Non-Fitur ============
+drop_cols = ['actual_productivity_score', 'perceived_productivity_score']
+df.drop(columns=[col for col in drop_cols if col in df.columns], inplace=True)
+
+# ============ 6. Missing Value Handling ============
+num_cols = df.select_dtypes(include=['float64', 'int64']).columns.tolist()
+cat_cols = df.select_dtypes(include=['object', 'bool']).columns.tolist()
 
 num_imputer = SimpleImputer(strategy='median')
 cat_imputer = SimpleImputer(strategy='most_frequent')
@@ -35,29 +48,44 @@ cat_imputer = SimpleImputer(strategy='most_frequent')
 df[num_cols] = num_imputer.fit_transform(df[num_cols])
 df[cat_cols] = cat_imputer.fit_transform(df[cat_cols])
 
-# ============ 6. Encoding ============
-encoder = LabelEncoder()
-for col in cat_cols:
-    df[col] = encoder.fit_transform(df[col])
+# ============ 7. One-Hot Encoding for Categorical Features ============
+# (Best practice: one-hot for non-ordinal features)
+df_encoded = pd.get_dummies(df, columns=cat_cols, drop_first=True)
+X = df_encoded.drop(columns=['productivity_class'])
+y = df_encoded['productivity_class']
 
-# ============ 7. Split Data ============
-X = df.drop(columns=['productivity_class'])
-y = df['productivity_class']
-
+# ============ 8. Feature Scaling ============
 scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X)
+X_scaled = pd.DataFrame(X_scaled, columns=X.columns)
 
+# ============ 9. Feature Selection Otomatis ============
+rf_selector = RandomForestClassifier(random_state=42)
+rf_selector.fit(X_scaled, y)
+selector = SelectFromModel(rf_selector, prefit=True, threshold='mean')
+selected_features = X_scaled.columns[selector.get_support()]
+X_selected = X_scaled[selected_features]
+
+print("\nFitur terpilih (feature selection otomatis):")
+print(list(selected_features))
+
+# ============ 10. Train/Test Split ============
 X_train, X_test, y_train, y_test = train_test_split(
-    X_scaled, y, test_size=0.2, random_state=42
+    X_selected, y, test_size=0.2, random_state=42, stratify=y
 )
 
-# ============ 8. Train Random Forest ============
-rf = RandomForestClassifier(random_state=42)
-rf.fit(X_train, y_train)
+# ============ 11. Cross-Validation ============
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+rf_final = RandomForestClassifier(random_state=42)
+cv_scores = cross_val_score(rf_final, X_selected, y, cv=cv, scoring='f1')
+print(f"\nMean F1 (5-fold cross-validation): {cv_scores.mean():.4f}")
 
-# ============ 9. Prediksi & Evaluasi ============
-y_pred = rf.predict(X_test)
-y_proba = rf.predict_proba(X_test)[:, 1]
+# ============ 12. Model Training ============
+rf_final.fit(X_train, y_train)
+
+# ============ 13. Prediction & Evaluation ============
+y_pred = rf_final.predict(X_test)
+y_proba = rf_final.predict_proba(X_test)[:, 1]
 
 acc = accuracy_score(y_test, y_pred)
 prec = precision_score(y_test, y_pred)
@@ -73,38 +101,49 @@ print(f"Recall: {rec:.4f}")
 print(f"F1 Score: {f1:.4f}")
 print(f"ROC AUC: {roc_auc:.4f}")
 print(f"Confusion Matrix:\n{cm}")
+print("\nClassification Report:\n", classification_report(y_test, y_pred))
 
-# ============ 10. Feature Importance ============
-importances = rf.feature_importances_
-features = X.columns
+# ============ 14. Analisis Error ============
+error_idx = np.where(y_test != y_pred)[0]
+if len(error_idx) > 0:
+    print(f"\nContoh prediksi salah (max 5):")
+    sample = X_test.iloc[error_idx[:5]]
+    print(sample)
+else:
+    print("\nTidak ada prediksi salah pada test set!")
+
+# ============ 15. Feature Importance ============
+importances = rf_final.feature_importances_
 feat_importance = pd.DataFrame({
-    'Feature': features,
+    'Feature': selected_features,
     'Importance': importances
 }).sort_values(by='Importance', ascending=False)
 
-print("\n🔥 Top 10 Fitur Penting:")
+print("\n🔥Fitur Penting (dari fitur terpilih):")
 print(feat_importance.head(10))
 
-# ============ 11. Cek Kontribusi Fitur Sosial Media ============
+# ============ 16. Kontribusi Fitur Sosial Media ============
 social_features = [
     'daily_social_media_time',
+    'work_hours_per_day',
+    'sleep_hours',
     'screen_time_before_sleep',
-    'number_of_notifications',
-    'weekly_offline_hours'
-]
+    'weekly_offline_hours',
+    'job_satisfaction_score'
 
-social_importance = feat_importance[feat_importance['Feature'].isin(social_features)]
-total_importance = feat_importance['Importance'].sum()
+]
+social_in_selected = [f for f in selected_features if any(sf in f for sf in social_features)]
+social_importance = feat_importance[feat_importance['Feature'].isin(social_in_selected)]
 social_total = social_importance['Importance'].sum()
+total_importance = feat_importance['Importance'].sum()
 social_percent = (social_total / total_importance) * 100
 
 print("\n🔍 Persentase kontribusi fitur sosial media terhadap model:")
 for _, row in social_importance.iterrows():
     print(f"- {row['Feature']}: {row['Importance']*100:.2f}%")
+print(f"🎯 Total kontribusi fitur sosial media: {social_percent:.2f}%")
 
-print(f"\n🎯 Total kontribusi fitur sosial media: {social_percent:.2f}%")
-
-# ============ 12. Persentase Prediksi Produktif / Tidak ============
+# ============ 17. Persentase Prediksi Produktif / Tidak ============
 unique, counts = np.unique(y_pred, return_counts=True)
 total_pred = sum(counts)
 class_labels = ['Tidak Produktif', 'Produktif']
@@ -112,12 +151,12 @@ print("\n📈 Persentase Hasil Prediksi:")
 for label, count in zip(class_labels, counts):
     print(f"- {label}: {100 * count / total_pred:.2f}%")
 
-# ============ 13. Visualisasi ============
-plt.figure(figsize=(14, 6))
+# ============ 18. Visualisasi ============
+plt.figure(figsize=(16, 6))
 
 # ROC Curve
 fpr, tpr, _ = roc_curve(y_test, y_proba)
-plt.subplot(1, 2, 1)
+plt.subplot(1, 3, 1)
 plt.plot(fpr, tpr, label=f'AUC = {roc_auc:.2f}', color='darkorange')
 plt.plot([0, 1], [0, 1], linestyle='--', color='gray')
 plt.title('ROC Curve')
@@ -126,11 +165,54 @@ plt.ylabel('True Positive Rate')
 plt.legend()
 
 # Confusion Matrix
-plt.subplot(1, 2, 2)
+plt.subplot(1, 3, 2)
 sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
 plt.title('Confusion Matrix')
 plt.xlabel('Predicted')
 plt.ylabel('Actual')
 
+# Feature Importance
+plt.subplot(1, 3, 3)
+sns.barplot(x='Importance', y='Feature', data=feat_importance.head(10))
+plt.title('Top 10 Feature Importance')
+
 plt.tight_layout()
 plt.show()
+
+# ============ 19. Distribusi Target dan Fitur ============
+plt.figure(figsize=(12,4))
+plt.subplot(1,2,1)
+sns.countplot(x=y)
+plt.title('Distribusi Kelas Target (Produktif/ Tidak Produktif)')
+plt.xticks([0,1], ['Tidak Produktif', 'Produktif'])
+plt.subplot(1,2,2)
+sns.histplot(df['daily_social_media_time'], bins=20, kde=True)
+plt.title('Distribusi Waktu Penggunaan Media Sosial per Hari')
+plt.show()
+
+# ============ 20. Save Model & Scaler (Optional) ============
+import joblib
+joblib.dump(rf_final, 'rf_productivity_model.joblib')
+joblib.dump(scaler, 'scaler_productivity.joblib')
+joblib.dump(selected_features, 'selected_features.joblib')
+print("\nModel, scaler, dan fitur terpilih sudah disimpan (joblib).")
+
+# ============ 21. Fungsi Prediksi Baru ============
+def predict_productivity(new_df):
+    # Impute
+    new_df[num_cols] = num_imputer.transform(new_df[num_cols])
+    new_df[cat_cols] = cat_imputer.transform(new_df[cat_cols])
+    # One hot encode
+    new_encoded = pd.get_dummies(new_df, columns=cat_cols, drop_first=True)
+    # Pastikan kolom sama
+    for col in X.columns:
+        if col not in new_encoded.columns:
+            new_encoded[col] = 0
+    new_encoded = new_encoded[X.columns]  # urutan sama
+    # Scaling & feature selection
+    new_scaled = scaler.transform(new_encoded)
+    new_selected = pd.DataFrame(new_scaled, columns=X.columns)[list(selected_features)]
+    result = rf_final.predict(new_selected)
+    return result
+
+print("\nFungsi predict_productivity(new_df) siap digunakan untuk prediksi data baru!")
